@@ -1,9 +1,10 @@
-import sqlite3
+from backend.db import get_connection
 
-DB_path = "C:\pythonprog\cyber-detection-agent(backend)\data\logs.sqlite"
+
 def log_event(event_type, method, endpoint, username, ip, status_code, status):
+    """Insert a single log row into the logs table."""
 
-    conn = sqlite3.connect(DB_path)
+    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("""

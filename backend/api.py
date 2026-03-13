@@ -1,8 +1,27 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
-from fastapi import FastAPI, Request
+
+from backend.db import init_db
 from backend.logger import log_event
 
-app = FastAPI()
+
+# ---------------------------------------------------------------------------
+# Lifespan – runs init_db() once when the server starts
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()          # ensure schema exists before the first request
+    yield              # app is running
+    # (shutdown logic, if any, goes here)
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {"message": "Cyber Threat Detection Victim API Running"}
