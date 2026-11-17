@@ -1,14 +1,14 @@
 # 🛡️ AI-Driven Autonomous Cyber Threat Hunting Agent
 
 A real-time Security Operations Centre (SOC) simulation built for the HackNocturn hackathon.
-The system monitors a live "victim" web application, applies deterministic rules to detect 8 distinct attack types, uses a local LLM to generate human-readable incident reports, and streams everything to an interactive Streamlit dashboard.
+The system monitors a live "victim" web application, applies deterministic rules to detect 8 distinct attack types, uses Groq Cloud API (`openai/gpt-oss-120b`) or local Ollama to generate human-readable incident reports, and streams everything to an interactive Streamlit dashboard.
 
 ---
 
 ## Architecture
 
 ```text
-Attacker (Requestly browser extension)
+Attacker (Requestly browser extension / Mock Simulator)
          │
          ▼
  Victim App  ─── FastAPI (backend/api.py)
@@ -19,7 +19,7 @@ Attacker (Requestly browser extension)
          ▼
  Threat Hunting Agent (agent/main.py)
    ├── Rule Engine  (agent/rules_engine.py)   ← 100 % deterministic
-   └── LLM Client   (agent/llm_client.py)     ← Ollama llama3.1:8b
+   └── LLM Client   (agent/llm_client.py)     ← Groq Cloud (openai/gpt-oss-120b) / Ollama
          │
          ▼
  data/logs.sqlite   ◄── alerts table written by agent
@@ -83,13 +83,10 @@ cyber-threat-hunting-agent/
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| Python | 3.13+ | |
-| [uv](https://docs.astral.sh/uv/) | latest | dependency management |
-| [Ollama](https://ollama.com) | latest | local LLM runtime |
-| llama3.1:8b | — | `ollama pull llama3.1:8b` |
-
-> **GPU note:** `llama3.1:8b` runs at ~1–3 s/response on an NVIDIA RTX 4060 (8 GB VRAM).
-> On CPU it takes 20–40 s but the agent degrades gracefully — detection still works instantly.
+| Python | 3.11+ / 3.13+ | |
+| [uv](https://docs.astral.sh/uv/) / pip | latest | Dependency management |
+| Groq Cloud API | Active Key | Default production model: `openai/gpt-oss-120b` |
+| [Ollama](https://ollama.com) | Optional | Local offline fallback runtime (`llama3.1:8b`) |
 
 ---
 
@@ -97,17 +94,34 @@ cyber-threat-hunting-agent/
 
 ```bash
 # 1. Clone the repository
-git clone <repo-url>
-cd cyber-threat-hunting-agent
+git clone https://github.com/Krishna2805/Cyber_Threat_Hunting_Agent.git
+cd Cyber_Threat_Hunting_Agent
 
-# 2. Install dependencies with uv
+# 2. Install dependencies with uv (or pip)
 uv sync
+# Or with standard pip: pip install -e .
 
-# 3. Pull the LLM model (one-time download, ~4.7 GB)
-ollama pull llama3.1:8b
+# 3. Configure Environment Variables
+cp .env.example .env
+# Set GROQ_API_KEY in .env (Model defaults to openai/gpt-oss-120b)
 
-# 4. Make sure Ollama is running
-ollama serve
+# 4. Optional: If running completely offline with local Ollama
+# Set USE_GROQ=false in .env and run:
+# ollama pull llama3.1:8b && ollama serve
+```
+
+---
+
+## Quick Verification Commands
+
+**1-Line LLM Health & Cloud Connectivity Check**:
+```bash
+python -c "import sys; sys.path.insert(0, 'agent'); import llm_client; print(llm_client.check_llm_health()['message'])"
+```
+
+**Headless Traffic & Threat Simulation**:
+```bash
+python mock_generator.py --once
 ```
 
 ---
