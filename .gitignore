@@ -142,11 +142,6 @@ test-results/
 .AGENT_DOCUMENTATION.md
 .CHANGELOG.md
 
-# Private local development notes & backlogs (never commit or track)
+# Local developer notes & scratch files
 *.local.md
 .*.local.md
-.dev_notes.local.md
-DEFECTS_AND_BACKLOG.md
-*DEFECT*
-*BACKLOG*
-*ISSUE*
