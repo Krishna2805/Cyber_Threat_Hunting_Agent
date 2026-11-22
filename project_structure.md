@@ -1,3 +1,5 @@
+> **Historical:** this is the original team folder plan from the hackathon. The implemented layout differs (single `pyproject.toml`, no per-folder requirements, run commands from the project root). See README.md for the current structure and commands.
+
 # Project Structure Outline: Cyber Threat Hunting Agent
 
 This specific folder structure separates concerns perfectly so all 3 team members can work simultaneously in their assigned domains without causing merge conflicts or breaking the code integration.

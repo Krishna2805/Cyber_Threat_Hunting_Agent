@@ -477,7 +477,7 @@ def run_all_attacks_once() -> None:
         time.sleep(0.3)
     print("\n[mock] All scenarios complete.")
     print(
-        "[mock] Start (or wait for) agent/main.py to detect these logs and call Ollama."
+        "[mock] Start (or wait for) agent/main.py to detect these logs and call the LLM."
     )
 
 

@@ -152,9 +152,10 @@ class ThreatAlert:
     timestamp: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    llm_hypothesis: str = ""  # filled in by llm_client after detection
-    llm_report: str = ""  # filled in by llm_client after detection
+    llm_hypothesis: str | None = ""  # filled in by llm_client; None if the call failed
+    llm_report: str | None = ""  # filled in by llm_client; None if the call failed
     llm_cache_used: bool = False  # True if LLM response(s) came from in-memory cache
+    llm_status: str = "pending"  # "pending" | "ok" | "truncated" | "error"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -168,6 +169,7 @@ class ThreatAlert:
             "llm_hypothesis": self.llm_hypothesis,
             "llm_report": self.llm_report,
             "llm_cache_used": self.llm_cache_used,
+            "llm_status": self.llm_status,
         }
 
 
@@ -238,7 +240,10 @@ def _already_alerted(
         SELECT COUNT(*) FROM alerts
         WHERE threat_type = ?
           AND source_ip   = ?
-          AND timestamp  >= datetime('now', ? || ' seconds')
+          -- datetime() normalises the agent's ISO 'T...+00:00' timestamps;
+          -- a plain string compare against 'YYYY-MM-DD HH:MM:SS' was true
+          -- until UTC midnight instead of for 300 s.
+          AND datetime(timestamp) >= datetime('now', ? || ' seconds')
         """,
         (threat_type, source_ip, f"-{cooldown}"),
     )

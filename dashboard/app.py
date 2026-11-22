@@ -14,13 +14,15 @@ Improvements over v1:
   - Events timeline chart (altair, 30-second buckets)
   - Attack type distribution chart (altair, horizontal bars)
   - Top attacking IPs panel
-  - Sidebar reset button to wipe DB between demo runs
+  - Blocked-IPs panel with an Unblock button, and a tab that deletes logs
+    older than 15 minutes (the only two places the dashboard writes)
 """
 
 import html as html_lib
 import json
 import os
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -34,6 +36,10 @@ IST = timezone(timedelta(hours=5, minutes=30), "IST")
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "data", "logs.sqlite")
+
+# Trusted IPs come from the agent's rules engine (single source of truth).
+sys.path.insert(0, os.path.join(BASE_DIR, "agent"))
+from rules_engine import BASELINE  # noqa: E402
 
 # ── Page config (runs once, outside the fragment) ─────────────────────────────
 st.set_page_config(
@@ -239,6 +245,16 @@ html, body, [class*="css"] {
     color:#3fb950; background:rgba(63,185,80,0.08); border:1px solid rgba(63,185,80,0.3);
     border-radius:3px; padding:3px 8px; margin:6px 0 4px 0; display:inline-block;
 }
+.llm-unavail-badge {
+    font-family:'Share Tech Mono',monospace; font-size:0.6rem; letter-spacing:1.5px;
+    color:#d29922; background:rgba(210,153,34,0.08); border:1px solid rgba(210,153,34,0.3);
+    border-radius:3px; padding:3px 8px; margin:6px 0 4px 0; display:inline-block;
+}
+.llm-pending-badge {
+    font-family:'Share Tech Mono',monospace; font-size:0.6rem; letter-spacing:1.5px;
+    color:#8b949e; background:rgba(139,148,158,0.08); border:1px solid rgba(139,148,158,0.3);
+    border-radius:3px; padding:3px 8px; margin:6px 0 4px 0; display:inline-block;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -426,6 +442,25 @@ def conf_color(c: int) -> str:
 def safe_html(text) -> str:
     """Escape any LLM / agent-generated text before embedding in raw HTML."""
     return html_lib.escape(str(text)) if text else ""
+
+
+def _cell(value) -> str:
+    """DB cell → str, treating SQL NULL / pandas NaN as empty."""
+    return "" if value is None or pd.isna(value) else str(value)
+
+
+# alerts.llm_status ("cached" = ok + llm_cache_used) → (css class, badge text)
+LLM_BADGES: dict[str, tuple[str, str]] = {
+    "error": ("llm-unavail-badge", "⚠ AI SUMMARY UNAVAILABLE — LLM call failed or was rate-limited"),
+    "truncated": ("llm-unavail-badge", "⚠ AI SUMMARY UNAVAILABLE — LLM response was truncated"),
+    "pending": ("llm-pending-badge", "… AI ANALYSIS PENDING"),
+    "cached": (
+        "llm-cache-badge",
+        "⚡ CACHED RESPONSE — Attack pattern already seen within last 5 min"
+        " · LLM call skipped, 0 new API tokens used",
+    ),
+    "ok": ("llm-live-badge", "🔴 LIVE LLM CALL — analysed by the LLM in real time"),
+}
 
 
 # ── Mitigation lookup (mirrors rules_engine.MITIGATIONS — no AI involved) ────
@@ -702,8 +737,9 @@ def live_dashboard():
                             "Investigate the source IP and review recent logs.",
                         )
                     )
-                    llm = safe_html(t.get("llm_report", ""))
-                    hypothesis = safe_html(t.get("llm_hypothesis", ""))
+                    llm = safe_html(_cell(t.get("llm_report")))
+                    hypothesis = safe_html(_cell(t.get("llm_hypothesis")))
+                    llm_status = _cell(t.get("llm_status"))
                     cache_used = int(t.get("llm_cache_used") or 0)
 
                     # Parse triggered_rules safely
@@ -716,6 +752,10 @@ def live_dashboard():
                     rule_tags = "".join(
                         f'<span class="rule-tag">{safe_html(r)}</span>' for r in rules
                     )
+                    if str(t.get("source_ip", "")) in BASELINE["trusted_ips"]:
+                        rule_tags += (
+                            '<span class="rule-tag">TRUSTED IP · NOT AUTO-BLOCKED</span>'
+                        )
                     conf_bar = (
                         f'<div class="conf-bar-bg">'
                         f'<div class="conf-bar-fill" style="width:{conf}%;background:{conf_color(conf)}"></div>'
@@ -723,23 +763,13 @@ def live_dashboard():
                     )
                     badge = f'<span class="badge badge-{risk}">{risk_raw}</span>'
 
-                    # LLM source badge — shown whenever LLM text is present
-                    if llm or hypothesis:
-                        if cache_used:
-                            llm_status_block = (
-                                '<div class="llm-cache-badge">'
-                                "⚡ CACHED RESPONSE — Attack pattern already seen within last 5 min"
-                                " · Ollama call skipped, 0 new API tokens used"
-                                "</div>"
-                            )
-                        else:
-                            llm_status_block = (
-                                '<div class="llm-live-badge">'
-                                "🔴 LIVE LLM CALL — Ollama analysed this threat in real-time"
-                                "</div>"
-                            )
-                    else:
-                        llm_status_block = ""
+                    # LLM status badge. llm_status is NULL on rows written
+                    # before the column existed — those get no badge.
+                    badge_key = "cached" if llm_status == "ok" and cache_used else llm_status
+                    css_class, badge_text = LLM_BADGES.get(badge_key, ("", ""))
+                    llm_status_block = (
+                        f'<div class="{css_class}">{badge_text}</div>' if badge_text else ""
+                    )
 
                     hyp_block = (
                         f'<div class="llm-label">◈ AI HYPOTHESIS</div>'

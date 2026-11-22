@@ -49,21 +49,29 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
-    # Load .env from project root or agent directory with override=True
-    _env_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-    if os.path.exists(_env_root):
-        load_dotenv(_env_root, override=True)
-    load_dotenv(override=True)
-except ImportError:
-    pass
+# Load <project root>/.env only (a bare load_dotenv() would walk up parent
+# directories). override=True: values in .env win over the shell environment.
+load_dotenv(
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+    override=True,
+)
 
 # ── Groq connection settings (Cloud Provider) ────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
+GROQ_MODELS_URL = GROQ_API_URL.rsplit("/chat/completions", 1)[0] + "/models"
+# USE_GROQ=false forces the local Ollama path even when a key is configured.
+USE_GROQ = os.getenv("USE_GROQ", "true").strip().lower() not in ("0", "false", "no")
+LLM_PROVIDER = "Groq" if (GROQ_API_KEY and USE_GROQ) else "Ollama"
+
+# LLM call outcome, stored in alerts.llm_status:
+#   "ok"        → complete text
+#   "truncated" → the model hit its token limit; partial text is discarded
+#   "error"     → HTTP / network / rate-limit failure; nothing stored
+LLMResult = tuple[str | None, str]  # (text, status)
 
 # ── Ollama connection settings (Local Fallback) ──────────────────────────────
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -168,10 +176,11 @@ def _cache_set(threat_type: str, source_ip: str, kind: str, value: str) -> None:
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 
-def _query_groq(prompt: str, system_prompt: str = "") -> str:
+def _query_groq(prompt: str, system_prompt: str = "") -> LLMResult:
     """
     Low-level POST to the Groq OpenAI-compatible chat completions endpoint.
-    Includes rate limit retry handling.
+    Retries once: after a 429 it waits for Retry-After (capped at 10 s),
+    after a network error it waits 0.5 s.
     """
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -186,34 +195,39 @@ def _query_groq(prompt: str, system_prompt: str = "") -> str:
         "model": GROQ_MODEL,
         "messages": messages,
         "temperature": 0.3,
-        "max_tokens": 300,
+        # gpt-oss counts hidden reasoning tokens against max_tokens, so the
+        # budget must cover reasoning + the 2-3 sentence answer.
+        "max_tokens": 1024,
     }
+    if "gpt-oss" in GROQ_MODEL:
+        payload["reasoning_effort"] = "low"
 
     for attempt in range(2):
         try:
-            response = requests.post(
-                GROQ_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=15,
-            )
+            response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=15)
             if response.status_code == 429:
-                time.sleep(1.0)
-                continue
+                if attempt == 0:
+                    # A malformed header raises here and takes the 0.5 s retry below.
+                    time.sleep(min(float(response.headers.get("retry-after", 2)), 10.0))
+                    continue
+                return None, "error"
             response.raise_for_status()
-            data = response.json()
-            return data["choices"][0]["message"]["content"].strip()
-        except Exception as e:
+            choice = response.json()["choices"][0]
+            text = (choice["message"].get("content") or "").strip()
+            if choice.get("finish_reason") == "length":
+                return None, "truncated"
+            return (text, "ok") if text else (None, "error")
+        except Exception:
             if attempt == 1:
-                return f"[Groq Error: {e}]"
+                return None, "error"
             time.sleep(0.5)
 
-    return "[Groq Rate Limit Exceeded]"
+    return None, "error"
 
 
-def _query_llm(prompt: str, system_prompt: str = "") -> str:
-    """Dispatches query to Groq if GROQ_API_KEY is configured, else falls back to local Ollama."""
-    if GROQ_API_KEY:
+def _query_llm(prompt: str, system_prompt: str = "") -> LLMResult:
+    """Dispatches to Groq if GROQ_API_KEY is set and USE_GROQ is not false, else to local Ollama."""
+    if LLM_PROVIDER == "Groq":
         return _query_groq(prompt, system_prompt)
     return _query_ollama(prompt, system_prompt)
 
@@ -227,14 +241,12 @@ def _is_ollama_running() -> bool:
         return False
 
 
-def _query_ollama(prompt: str, system_prompt: str = "") -> str:
+def _query_ollama(prompt: str, system_prompt: str = "") -> LLMResult:
     """
     Low-level POST to the Ollama /api/generate endpoint.
 
-    Returns the model's response text, or a fallback string if the
-    server is unreachable / returns an error.  The agent continues
-    working even when the LLM is offline — it just loses the pretty
-    text formatting.
+    Returns (text, "ok"), or (None, "truncated"/"error").  The agent keeps
+    working when the LLM is offline — the alert just has no AI text.
     """
     payload = {
         "model": MODEL_NAME,
@@ -245,26 +257,16 @@ def _query_ollama(prompt: str, system_prompt: str = "") -> str:
     }
 
     try:
-        response = requests.post(
-            OLLAMA_GENERATE_URL,
-            json=payload,
-            timeout=REQUEST_TIMEOUT,
-        )
+        response = requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         result = response.json()
-        text = result.get("response", "").strip()
-        return text if text else "[LLM returned an empty response]"
+    except Exception:
+        return None, "error"
 
-    except requests.exceptions.ConnectionError:
-        return "[LLM Offline] Could not reach Ollama. Is it running? → ollama serve"
-    except requests.exceptions.Timeout:
-        return f"[LLM Timeout] Model took longer than {REQUEST_TIMEOUT}s to respond."
-    except requests.exceptions.HTTPError as e:
-        return f"[LLM HTTP Error] {e}"
-    except (KeyError, json.JSONDecodeError) as e:
-        return f"[LLM Parse Error] Unexpected response format: {e}"
-    except Exception as e:
-        return f"[LLM Unknown Error] {e}"
+    if result.get("done_reason") == "length":
+        return None, "truncated"
+    text = (result.get("response") or "").strip()
+    return (text, "ok") if text else (None, "error")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -275,19 +277,34 @@ def check_ollama_health() -> dict:
     Returns a status dict so main.py can log a friendly startup message.
     Supports both Groq and Ollama.
     """
-    if GROQ_API_KEY:
-        masked_key = f"{GROQ_API_KEY[:6]}...{GROQ_API_KEY[-4:]}" if len(GROQ_API_KEY) > 10 else "***"
+    if LLM_PROVIDER == "Groq":
+        # Real (token-free) call: list models with the configured key.
+        try:
+            r = requests.get(
+                GROQ_MODELS_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                timeout=10,
+            )
+        except Exception as e:
+            return {"status": "error", "message": f"Cannot reach Groq API ({type(e).__name__})."}
+        if r.status_code == 401:
+            return {"status": "error", "message": "Groq rejected GROQ_API_KEY (HTTP 401)."}
+        if r.status_code != 200:
+            return {"status": "warning", "message": f"Groq API returned HTTP {r.status_code}."}
+        ids = {m.get("id") for m in r.json().get("data", [])}
+        if GROQ_MODEL not in ids:
+            return {"status": "warning", "message": f"Groq key OK, but model '{GROQ_MODEL}' is not available."}
         return {
             "status": "ok",
-            "message": f"Groq Cloud LLM configured with model {GROQ_MODEL} (Key: {masked_key}) [OK]",
+            "message": f"Groq Cloud LLM reachable, key accepted, model {GROQ_MODEL} available [OK]",
         }
 
     if not _is_ollama_running():
         return {
             "status": "error",
             "message": (
-                f"Cannot connect to Ollama on {OLLAMA_BASE_URL} and GROQ_API_KEY is not set. "
-                "Set GROQ_API_KEY in .env or run: ollama serve"
+                f"Cannot connect to Ollama on {OLLAMA_BASE_URL} and Groq is not in use "
+                "(GROQ_API_KEY unset or USE_GROQ=false). Set GROQ_API_KEY in .env or run: ollama serve"
             ),
         }
 
@@ -362,7 +379,7 @@ def generate_hypothesis(
     observation: str,
     threat_type: str = "",
     source_ip: str = "",
-) -> tuple[str, bool]:
+) -> tuple[str | None, bool, str]:
     """
     Step 2 of the agent loop: Hypothesize.
 
@@ -387,14 +404,15 @@ def generate_hypothesis(
         source_ip:    The attacker's IP — used as part of the cache key.
 
     Returns:
-        (hypothesis_text, from_cache)
-        hypothesis_text: 1-2 sentence explanation of the attack.
+        (hypothesis_text, from_cache, status)
+        hypothesis_text: 1-2 sentence explanation, or None if the call failed.
         from_cache:      True if the response came from the in-memory cache.
+        status:          "ok" | "truncated" | "error" (failures are never cached).
     """
     # ── Cache lookup ─────────────────────────────────────────────────────────
     cached = _cache_get(threat_type, source_ip, "hyp")
     if cached is not None:
-        return cached, True  # served from cache — no Ollama call made
+        return cached, True, "ok"  # served from cache — no LLM call made
 
     # ── Build threat-type-aware prompts ──────────────────────────────────────
     threat_context = _THREAT_CONTEXT.get(
@@ -421,12 +439,13 @@ def generate_hypothesis(
         "In 1-2 sentences, explain what this attacker is doing and the immediate risk."
     )
 
-    result = _query_llm(prompt, system)
+    text, status = _query_llm(prompt, system)
 
-    # ── Cache store ──────────────────────────────────────────────────────────
-    _cache_set(threat_type, source_ip, "hyp", result)
+    # ── Cache store (successful responses only) ──────────────────────────────
+    if status == "ok":
+        _cache_set(threat_type, source_ip, "hyp", text)
 
-    return result, False  # generated live by LLM
+    return text, False, status
 
 
 def generate_incident_report(
@@ -436,7 +455,7 @@ def generate_incident_report(
     mitigation: str,
     hypothesis: str = "",
     observation: str = "",
-) -> tuple[str, bool]:
+) -> tuple[str | None, bool, str]:
     """
     Final step of the agent loop: Explain.
 
@@ -468,14 +487,15 @@ def generate_incident_report(
                       Included in the prompt for richer, more specific output.
 
     Returns:
-        (report_text, from_cache)
-        report_text: 2-3 sentence professional SOC incident report paragraph.
+        (report_text, from_cache, status)
+        report_text: 2-3 sentence SOC report paragraph, or None if the call failed.
         from_cache:  True if the response came from the in-memory cache.
+        status:      "ok" | "truncated" | "error" (failures are never cached).
     """
     # ── Cache lookup ─────────────────────────────────────────────────────────
     cached = _cache_get(threat_type, source_ip, "rep")
     if cached is not None:
-        return cached, True  # served from cache — no Ollama call made
+        return cached, True, "ok"  # served from cache — no LLM call made
 
     # ── Build prompt ─────────────────────────────────────────────────────────
     IST = timezone(timedelta(hours=5, minutes=30))
@@ -511,9 +531,10 @@ def generate_incident_report(
         "Detection Time above and referencing the specific evidence provided."
     )
 
-    result = _query_llm(prompt, system)
+    text, status = _query_llm(prompt, system)
 
-    # ── Cache store ──────────────────────────────────────────────────────────
-    _cache_set(threat_type, source_ip, "rep", result)
+    # ── Cache store (successful responses only) ──────────────────────────────
+    if status == "ok":
+        _cache_set(threat_type, source_ip, "rep", text)
 
-    return result, False  # generated live by LLM
+    return text, False, status

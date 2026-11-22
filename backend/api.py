@@ -179,6 +179,8 @@ async def login(request: Request):
         data = await request.json()
     except Exception:
         data = {}
+    if not isinstance(data, dict):  # e.g. a JSON array or string body
+        data = {}
 
     username: str = str(data.get("username", "unknown"))
     password: Optional[str] = data.get("password")
@@ -218,6 +220,8 @@ async def api_auth_login(request: Request):
     try:
         data = await request.json()
     except Exception:
+        data = {}
+    if not isinstance(data, dict):  # e.g. a JSON array or string body
         data = {}
 
     username: str = str(data.get("username", "unknown"))

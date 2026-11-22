@@ -1,14 +1,21 @@
 [project]
 name = "cyber-threat-hunting-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Rule-based threat detection agent with LLM-written incident reports, a FastAPI victim app and a Streamlit SOC dashboard"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "altair>=5.0.0",
     "fastapi>=0.135.1",
     "pandas>=2.3.3",
+    "python-dotenv>=1.0.0",
     "requests>=2.31.0",
     "streamlit>=1.55.0",
     "uvicorn>=0.41.0",
 ]
+
+# The code runs from source (python agent/main.py, streamlit run ...), so
+# nothing is packaged; this only stops setuptools flat-layout auto-discovery
+# from failing `pip install -e .`, which then installs the dependencies.
+[tool.setuptools]
+packages = []

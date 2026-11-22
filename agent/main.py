@@ -26,13 +26,21 @@ import sys
 # ---------------------------------------------------------------------------
 # Python version guard — must be checked before any other imports
 # ---------------------------------------------------------------------------
-if sys.version_info < (3, 9):
+if sys.version_info < (3, 11):
     print(
-        f"\n[ERROR] Python 3.9+ is required. You are running {sys.version}.\n"
+        f"\n[ERROR] Python 3.11+ is required. You are running {sys.version}.\n"
         "        Please upgrade Python or activate the correct virtual environment.\n"
         "        Tested on: Python 3.11 and Python 3.13\n"
     )
     sys.exit(1)
+
+# Console output uses glyphs (→ ↳ ⚠ ─). When stdout is redirected on Windows
+# it defaults to cp1252, which cannot encode them, so force UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 import json
 import os
@@ -60,11 +68,12 @@ SCHEMA_PATH = os.path.join(_ROOT_DIR, "data", "schema.sql")
 sys.path.insert(0, _THIS_DIR)  # make sure local imports work regardless of cwd
 
 from llm_client import (  # noqa: E402
+    LLM_PROVIDER,
     check_ollama_health,
     generate_hypothesis,
     generate_incident_report,
 )
-from rules_engine import ThreatAlert, get_mitigation, run_all_rules  # noqa: E402
+from rules_engine import BASELINE, ThreatAlert, get_mitigation, run_all_rules  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Agent configuration
@@ -139,12 +148,16 @@ def _ensure_alerts_table(conn: sqlite3.Connection) -> None:
     )
     # Add llm_cache_used to any existing alerts table that predates this column.
     # ALTER TABLE is a no-op if the column already exists (caught and ignored).
-    try:
-        conn.execute(
-            "ALTER TABLE alerts ADD COLUMN llm_cache_used INTEGER NOT NULL DEFAULT 0"
-        )
-    except Exception:
-        pass  # column already exists — expected on all runs after the first
+    for ddl in (
+        "ALTER TABLE alerts ADD COLUMN llm_cache_used INTEGER NOT NULL DEFAULT 0",
+        # llm_status: 'pending' | 'ok' | 'truncated' | 'error'; NULL on rows
+        # written before this column existed.
+        "ALTER TABLE alerts ADD COLUMN llm_status TEXT",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already exists — expected on all runs after the first
     conn.commit()
 
 
@@ -183,7 +196,8 @@ def _ensure_blocked_ips_table(conn: sqlite3.Connection) -> None:
 
 def _save_alert_initial(conn: sqlite3.Connection, alert: ThreatAlert) -> int:  # noqa: E501
     """
-    Phase 1 — Insert the detection result immediately with empty LLM fields.
+    Phase 1 — Insert the detection result immediately (LLM fields NULL,
+    llm_status 'pending').
 
     This lets the dashboard show the threat (type, risk level, confidence,
     triggered rules) the instant the rules engine fires — without waiting
@@ -195,8 +209,8 @@ def _save_alert_initial(conn: sqlite3.Connection, alert: ThreatAlert) -> int:  #
         """
         INSERT INTO alerts
             (timestamp, threat_type, risk_level, confidence, source_ip,
-             triggered_rules, details, llm_hypothesis, llm_report)
-        VALUES (?, ?, ?, ?, ?, ?, ?, '', '')
+             triggered_rules, details, llm_hypothesis, llm_report, llm_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'pending')
         """,
         (
             alert.timestamp,
@@ -232,13 +246,15 @@ def _update_alert_llm(
         UPDATE alerts
         SET llm_hypothesis = ?,
             llm_report     = ?,
-            llm_cache_used = ?
+            llm_cache_used = ?,
+            llm_status     = ?
         WHERE id = ?
         """,
         (
             alert.llm_hypothesis,
             alert.llm_report,
             1 if alert.llm_cache_used else 0,
+            alert.llm_status,
             row_id,
         ),
     )
@@ -260,6 +276,15 @@ def _block_ip(conn: sqlite3.Connection, alert: ThreatAlert) -> None:
         attack that fires multiple rules doesn't create duplicate entries.
     """
     if alert.risk_level not in ("HIGH", "CRITICAL"):
+        return
+
+    # Trusted IPs (e.g. localhost running the dashboard) are alerted on but
+    # never auto-blocked, so the operator cannot lock themselves out.
+    if alert.source_ip in BASELINE["trusted_ips"]:
+        _log(
+            "warn",
+            f"  ↳ IP {alert.source_ip} is in trusted_ips — alert kept, NOT auto-blocked.",
+        )
         return
 
     # Check for an existing active block to avoid duplicate rows
@@ -388,7 +413,7 @@ def _enrich_with_llm(alert: ThreatAlert) -> ThreatAlert:
     # Cache key: (threat_type, source_ip, "hyp") — each unique (attack-type, IP)
     # pair gets its own targeted hypothesis, so multiple different threat types
     # firing from the same IP in the same cycle each get the correct response.
-    hyp_text, hyp_cached = generate_hypothesis(
+    hyp_text, hyp_cached, hyp_status = generate_hypothesis(
         observation,
         threat_type=alert.threat_type,
         source_ip=alert.source_ip,
@@ -398,25 +423,25 @@ def _enrich_with_llm(alert: ThreatAlert) -> ThreatAlert:
         _log(
             "info",
             f"  ↳ [CACHE HIT] Hypothesis ({alert.threat_type} / {alert.source_ip}) "
-            f"served from cache — Ollama call skipped",
+            f"served from cache — {LLM_PROVIDER} call skipped",
         )
     else:
         _log(
-            "info",
-            f"  ↳ [LIVE CALL] Ollama generated hypothesis  »  {alert.threat_type} "
-            f"from {alert.source_ip}",
+            "info" if hyp_status == "ok" else "warn",
+            f"  ↳ [LIVE CALL] {LLM_PROVIDER} hypothesis {hyp_status.upper()}  »  "
+            f"{alert.threat_type} from {alert.source_ip}",
         )
 
     # ── Step: Explain ────────────────────────────────────────────────────────
     # The observation string is forwarded alongside the raw details dict so
     # the LLM has a clear narrative starting point specific to this attack type.
     mitigation = get_mitigation(alert.threat_type)
-    rep_text, rep_cached = generate_incident_report(
+    rep_text, rep_cached, rep_status = generate_incident_report(
         threat_type=alert.threat_type,
         source_ip=alert.source_ip,
         details=alert.details,
         mitigation=mitigation,
-        hypothesis=alert.llm_hypothesis,
+        hypothesis=alert.llm_hypothesis or "",
         observation=observation,
     )
     alert.llm_report = rep_text
@@ -424,17 +449,20 @@ def _enrich_with_llm(alert: ThreatAlert) -> ThreatAlert:
         _log(
             "info",
             f"  ↳ [CACHE HIT] Incident report ({alert.threat_type} / {alert.source_ip}) "
-            f"served from cache — Ollama call skipped",
+            f"served from cache — {LLM_PROVIDER} call skipped",
         )
     else:
         _log(
-            "info",
-            f"  ↳ [LIVE CALL] Ollama generated incident report  »  {alert.threat_type}",
+            "info" if rep_status == "ok" else "warn",
+            f"  ↳ [LIVE CALL] {LLM_PROVIDER} incident report {rep_status.upper()}  »  "
+            f"{alert.threat_type}",
         )
 
     # Mark the alert so the dashboard can display the live-vs-cached badge.
     # True when EITHER the hypothesis OR the report came from the cache.
     alert.llm_cache_used = hyp_cached or rep_cached
+    # Worst outcome wins: error > truncated > ok.
+    alert.llm_status = max(hyp_status, rep_status, key=("ok", "truncated", "error").index)
 
     return alert
 
@@ -590,16 +618,33 @@ def _llm_worker(alert: ThreatAlert, row_id: int) -> None:
             _update_alert_llm(conn, row_id, enriched)
         finally:
             conn.close()
+        if enriched.llm_status == "ok":
+            tag = "  [CACHED]" if enriched.llm_cache_used else "  [LIVE]"
+            level = "ok"
+        else:
+            tag = f"  [LLM {enriched.llm_status.upper()} — no AI text stored]"
+            level = "warn"
         _log(
-            "ok",
-            f"[LLM] id={row_id} | {enriched.threat_type} | {enriched.source_ip}"
-            f"{'  [CACHED]' if enriched.llm_cache_used else '  [LIVE]'}",
+            level,
+            f"[LLM] id={row_id} | {enriched.threat_type} | {enriched.source_ip}{tag}",
         )
     except Exception as exc:
         _log("error", f"[LLM] Worker failed for alert id={row_id}: {exc}")
         import traceback
 
         traceback.print_exc()
+        # Don't leave the card stuck on 'pending'.
+        try:
+            conn = _get_connection()
+            try:
+                conn.execute(
+                    "UPDATE alerts SET llm_status = 'error' WHERE id = ?", (row_id,)
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
 
 
 def _run_agent_cycle() -> list:

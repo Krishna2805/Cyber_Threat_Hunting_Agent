@@ -1,3 +1,5 @@
+> **Historical:** these are the original hackathon design notes. The implemented system differs in places (SQLite only, Groq or Ollama, automatic IP blocking, the dashboard can unblock IPs and delete old logs). See README.md for current behaviour.
+
 Below is the updated system workflow documentation, redesigned to fit the 18-hour hackathon constraint and address structural flaws. It incorporates the "Victim App" concept, clarifies the teammate-driven Requestly attack workflow, replaces the in-memory queue with persistent local storage, and introduces an LLM strictly for explainability to counter the "How can you trust AI?" question.
 
 ---
