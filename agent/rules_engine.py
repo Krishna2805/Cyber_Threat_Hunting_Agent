@@ -204,17 +204,18 @@ def _already_alerted(
         request from this IP.  Creating another alert adds no value and would
         just flood the dashboard with duplicate cards.
 
-    Tier 2 — IP was previously blocked but was UNBLOCKED by an analyst
-        (has a row in blocked_ips with status='unblocked'):
-        Return False unconditionally — bypass the cooldown entirely.
-        Rationale: an analyst cleared the block, the IP immediately resumed
-        attacking, so it must be re-detected and re-blocked right away without
-        waiting 5 minutes.  This is the "repeat offender fast-path".
+    Tier 2 — IP was UNBLOCKED by an analyst (row with status='unblocked'):
+        The cooldown restarts at the latest unblock: only alerts created
+        after unblocked_at count.  So the first re-detection after an
+        Unblock fires immediately (the "repeat offender fast-path"), and
+        after that the normal cooldown applies again.  (Previously Tier 2
+        skipped the cooldown forever, so alerts that do not re-block the
+        IP — e.g. from a trusted IP — repeated on every 5 s poll.)
 
-    Tier 3 — IP has never been blocked before (no entry in blocked_ips):
+    Tier 3 — otherwise:
         Apply the standard alert_cooldown_seconds window (default 300 s).
-        This prevents alert storms for brand-new, still-active attacks while
-        the agent is polling every 5 seconds.
+        This prevents alert storms for still-active attacks while the agent
+        is polling every 5 seconds.
     """
     # ── Tier 1: currently blocked — no point alerting again ─────────────────
     currently_blocked = conn.execute(
@@ -224,16 +225,14 @@ def _already_alerted(
     if currently_blocked is not None:
         return True  # already handled by middleware — suppress duplicate alert
 
-    # ── Tier 2: previously blocked and unblocked — bypass cooldown ───────────
-    previously_blocked = conn.execute(
-        "SELECT 1 FROM blocked_ips WHERE ip = ? AND status = 'unblocked' LIMIT 1",
+    # ── Tier 2: unblocked — cooldown counts only alerts since the unblock ────
+    last_unblock = conn.execute(
+        "SELECT MAX(datetime(unblocked_at)) FROM blocked_ips "
+        "WHERE ip = ? AND status = 'unblocked'",
         (source_ip,),
-    ).fetchone()
-    if previously_blocked is not None:
-        # Skip the time-window check entirely — re-detect immediately
-        return False
+    ).fetchone()[0]  # None if the IP was never unblocked
 
-    # ── Tier 3: first-time attacker — apply standard cooldown ────────────────
+    # ── Tier 2 + 3: standard cooldown ────────────────────────────────────────
     cooldown = BASELINE["alert_cooldown_seconds"]
     cur = conn.execute(
         """
@@ -244,8 +243,9 @@ def _already_alerted(
           -- a plain string compare against 'YYYY-MM-DD HH:MM:SS' was true
           -- until UTC midnight instead of for 300 s.
           AND datetime(timestamp) >= datetime('now', ? || ' seconds')
+          AND (? IS NULL OR datetime(timestamp) >= ?)
         """,
-        (threat_type, source_ip, f"-{cooldown}"),
+        (threat_type, source_ip, f"-{cooldown}", last_unblock, last_unblock),
     )
     row = cur.fetchone()
     return row is not None and row[0] > 0
@@ -531,15 +531,18 @@ def check_credential_stuffing(conn: sqlite3.Connection) -> List[ThreatAlert]:
 # ---------------------------------------------------------------------------
 def check_account_takeover(conn: sqlite3.Connection) -> List[ThreatAlert]:
     """
-    An IP that accumulated multiple login failures then achieves a SUCCESSFUL
-    login within the same lookback window.  This is the most dangerous signal —
-    it means the attacker found a working credential.
+    One IP fails to log in to an account several times and then logs in to
+    THAT SAME account successfully, within the lookback window.  This is the
+    most dangerous signal — the attacker found a working credential.
 
-    Logic (two-step JOIN):
-      Step A: find IPs with >= account_takeover_min_failures failed logins
-              in the last account_takeover_window_seconds seconds.
-      Step B: find IPs with at least one successful login in the same window.
-      Match:  any IP present in BOTH sets = likely account takeover.
+    A success for (ip, username) counts only if at least
+    account_takeover_min_failures failures for the same (ip, username) come
+    BEFORE it.  Order is by log id, not timestamp: timestamps have 1-second
+    resolution, so a failure and the success often share one.  One alert per
+    IP; compromised_account lists every qualifying username.
+
+    Failures spread over many accounts that end in one success are not an
+    account takeover here — Credential Stuffing (Rule 4) covers that spray.
     """
     min_failures = BASELINE["account_takeover_min_failures"]
     window_s = BASELINE["account_takeover_window_seconds"]
@@ -547,30 +550,27 @@ def check_account_takeover(conn: sqlite3.Connection) -> List[ThreatAlert]:
 
     cur = conn.execute(
         """
-        SELECT f.ip,
-               f.failure_count,
-               s.compromised_account
+        SELECT ip,
+               MAX(fails_before)               AS failure_count,
+               GROUP_CONCAT(DISTINCT username) AS compromised_account
         FROM (
-            SELECT ip,
-                   COUNT(*) AS failure_count
-            FROM logs
-            WHERE event_type = 'login_attempt'
-              AND status     = 'fail'
-              AND timestamp >= datetime('now', ?)
-            GROUP BY ip
-            HAVING failure_count >= ?
-        ) f
-        JOIN (
-            SELECT ip,
-                   GROUP_CONCAT(DISTINCT username) AS compromised_account
-            FROM logs
-            WHERE event_type = 'login_attempt'
-              AND status     = 'success'
-              AND timestamp >= datetime('now', ?)
-            GROUP BY ip
-        ) s ON f.ip = s.ip
+            SELECT s.ip, s.username,
+                   (SELECT COUNT(*) FROM logs f
+                    WHERE f.event_type = 'login_attempt'
+                      AND f.status     = 'fail'
+                      AND f.ip         = s.ip
+                      AND f.username   = s.username
+                      AND f.id         < s.id
+                      AND f.timestamp >= datetime('now', ?)) AS fails_before
+            FROM logs s
+            WHERE s.event_type = 'login_attempt'
+              AND s.status     = 'success'
+              AND s.timestamp >= datetime('now', ?)
+        )
+        WHERE fails_before >= ?
+        GROUP BY ip
         """,
-        (window_str, min_failures, window_str),
+        (window_str, window_str, min_failures),
     )
     rows = cur.fetchall()
 

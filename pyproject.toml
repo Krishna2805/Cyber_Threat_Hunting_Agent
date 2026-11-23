@@ -14,6 +14,10 @@ dependencies = [
     "uvicorn>=0.41.0",
 ]
 
+# Installed by `uv sync` by default; pip users: pip install pytest
+[dependency-groups]
+dev = ["pytest>=8"]
+
 # The code runs from source (python agent/main.py, streamlit run ...), so
 # nothing is packaged; this only stops setuptools flat-layout auto-discovery
 # from failing `pip install -e .`, which then installs the dependencies.
