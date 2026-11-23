@@ -8,9 +8,13 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: ${{ secrets.EC2_HOST != '' }}
+    # The secrets context is not allowed in a job-level `if:`, so expose only
+    # whether EC2_HOST is set and skip the deploy step when it is not.
+    env:
+      HAS_EC2_HOST: ${{ secrets.EC2_HOST != '' }}
     steps:
       - name: Deploy to EC2
+        if: env.HAS_EC2_HOST == 'true'
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
