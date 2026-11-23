@@ -42,13 +42,14 @@ The LLM only translates rule output into SOC-report prose.
 | 2 | **Endpoint Reconnaissance** | > 3 restricted-path hits / min |
 | 3 | **Unauthorized Access Scan** | > 6 HTTP 401/403 responses / min |
 | 4 | **Credential Stuffing** | > 8 distinct usernames failing / min |
-| 5 | **Account Takeover** | ≥ 3 failures → successful login, same IP, 5 min window |
+| 5 | **Account Takeover** | ≥ 3 failed logins, then a successful login to the **same account** from the same IP, 5 min window (order by log id) |
 | 6 | **Data Exfiltration** | > 20 successful GETs to data endpoints / min |
 | 7 | **Path Traversal Attack** | any `../` or URL-encoded traversal in request path |
 | 8 | **DoS Rate Flood** | > 100 total requests / min from one IP |
 
 Rules are evaluated independently, so one attacker can trigger several types at once
 (e.g. a credential-stuffing IP also trips Brute Force and Unauthorized Access Scan).
+Failures spread across many accounts that end in one success are reported as Credential Stuffing, not Account Takeover.
 `mock_generator.py --once` fires 8 scenarios. If the agent sees the whole burst in one poll it raises 16–17 alerts covering all 8 types.
 If it polls mid-burst, an IP blocked by its first detected rule gets no further alert types (blocked IPs are not re-alerted), so you see fewer alerts and labels; all 8 attacker IPs are blocked either way.
 
@@ -62,7 +63,8 @@ CRITICAL ≥ 80, HIGH ≥ 60, MEDIUM ≥ 40 (alerts below 40 are dropped).
 - When the agent confirms a **HIGH** or **CRITICAL** alert it writes the source IP to the `blocked_ips` table.
 - The backend middleware checks that table on every request and answers blocked IPs with **HTTP 403** (the attempt is still logged with status `blocked`).
 - IPs listed in `BASELINE["trusted_ips"]` (default `10.0.0.1`, `127.0.0.1`) are still alerted on — the dashboard tags them `TRUSTED IP · NOT AUTO-BLOCKED` — but are never blocked automatically, so the machine running the demo cannot lock itself out.
-- The dashboard's **Blocked IPs** panel has an **Unblock** button. An unblocked IP skips the alert cooldown, so if it keeps attacking it is re-detected (and, if HIGH/CRITICAL, re-blocked) on the next cycle.
+- The dashboard's **Blocked IPs** panel has an **Unblock** button. Unblocking restarts the alert cooldown for that IP: if it keeps attacking, the first re-detection fires on the next cycle (and, if HIGH/CRITICAL, re-blocks it), then the normal 300 s cooldown applies.
+- **Limitation:** rules look back 60 s (300 s for Path Traversal and Account Takeover), and the attack's old log rows still count after an Unblock. An Unblock clicked within that window after the attack is undone at the next poll. **Demo tip:** wait about a minute after an attack before clicking Unblock (five minutes for Path Traversal or Account Takeover).
 
 ---
 
@@ -88,6 +90,9 @@ Cyber_Threat_Hunting_Agent/
 ├── data/
 │   ├── logs.sqlite     Shared SQLite database (created at first run, git-ignored)
 │   └── schema.sql      Table definitions for logs, alerts, blocked_ips
+│
+├── tests/
+│   └── test_rules.py   pytest: one case per rule + cooldown / trusted-IP / Unblock / ATO-ordering regressions
 │
 ├── mock_generator.py   Standalone traffic simulator: writes logs straight to the DB (no backend needed)
 ├── pyproject.toml      Python dependencies (managed with uv; pip also works)
@@ -145,6 +150,13 @@ uv run python -c "import sys; sys.path.insert(0, 'agent'); import llm_client; pr
 **Headless traffic simulation** (writes attack logs; run the agent afterwards to detect them):
 ```bash
 uv run python mock_generator.py --once
+```
+
+**Tests** (temporary SQLite file, stubbed LLM; never touch `data/logs.sqlite` or read `.env`):
+```bash
+uv run pytest            # uv sync installs pytest via the dev dependency group
+# pip route, inside a virtual environment:
+pip install -e . && pip install pytest && pytest
 ```
 
 ---
@@ -248,7 +260,7 @@ BASELINE = {
 }
 ```
 
-The cooldown does not apply to an IP that is currently blocked (no new alerts at all) or that an analyst has unblocked (re-detected immediately).
+Cooldown exceptions: an IP that is currently blocked gets no new alerts at all; for an IP an analyst has unblocked, the cooldown restarts at the unblock (alerts from before the unblock don't count), so its first re-detection fires immediately.
 
 ### Agent polling interval (`agent/main.py`)
 
@@ -295,6 +307,7 @@ Successful LLM responses are cached in memory per (threat type, IP): hypotheses 
 | `requests` | HTTP calls from the agent to Groq / Ollama |
 | `python-dotenv` | Loads `.env` for the agent |
 | `sqlite3` | Built-in — shared data layer |
+| `pytest` | Tests only (`dev` dependency group) |
 
 ---
 
